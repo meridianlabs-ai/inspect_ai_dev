@@ -25,6 +25,12 @@ _custom_models: dict[str, ModelInfo] = {}
 # Cached model info database
 _model_info_cache: dict[str, ModelInfo] | None = None
 
+# Cache of `get_model_info()` lookup results for string model names. Populated
+# on the slow path (db miss + fuzzy match + optional provider fallback) and
+# cleared whenever the custom-model registry changes. None values are cached
+# to avoid re-running fuzzy match for repeated misses.
+_model_info_lookup_cache: dict[str, ModelInfo | None] = {}
+
 
 def _get_model_info_db() -> dict[str, ModelInfo]:
     """Get the model info database, loading it on first access."""
@@ -279,11 +285,16 @@ def get_model_info(model: str | Model) -> ModelInfo | None:
     if isinstance(model, Model):
         name = model.canonical_name()
 
-        # Check custom registry first
+        # Check custom registry first (mutable, so checked ahead of cache)
         if name in _custom_models:
             return _custom_models[name]
 
-        return _lookup_in_db(name, db)
+        if name in _model_info_lookup_cache:
+            return _model_info_lookup_cache[name]
+
+        result = _lookup_in_db(name, db)
+        _model_info_lookup_cache[name] = result
+        return result
 
     # For string model names, try direct lookup first (no SDK required)
     # The database includes aliases for common model name formats
@@ -292,9 +303,13 @@ def get_model_info(model: str | Model) -> ModelInfo | None:
     if model in _custom_models:
         return _custom_models[model]
 
+    if model in _model_info_lookup_cache:
+        return _model_info_lookup_cache[model]
+
     # Try direct database lookup
     result = _lookup_in_db(model, db)
     if result is not None:
+        _model_info_lookup_cache[model] = result
         return result
 
     # Fall back to full provider instantiation (requires SDK)
@@ -304,12 +319,15 @@ def get_model_info(model: str | Model) -> ModelInfo | None:
         name = resolved.canonical_name()
 
         if name in _custom_models:
-            return _custom_models[name]
-
-        return _lookup_in_db(name, db)
+            value: ModelInfo | None = _custom_models[name]
+        else:
+            value = _lookup_in_db(name, db)
     except (ValueError, Exception):
         # Provider not available or unknown - already tried direct lookup
-        return None
+        value = None
+
+    _model_info_lookup_cache[model] = value
+    return value
 
 
 def get_model_input_tokens(model: Model) -> int | None:
@@ -346,6 +364,7 @@ def set_model_info(model: str, info: ModelInfo) -> None:
         ```
     """
     _custom_models[model] = info
+    _model_info_lookup_cache.clear()
 
 
 def set_model_cost(model: str, cost: ModelCost) -> None:
@@ -362,6 +381,7 @@ def set_model_cost(model: str, cost: ModelCost) -> None:
     if info is None:
         raise ValueError(f"Model '{model}' not found.")
     _custom_models[model] = info.model_copy(update={"cost": cost})
+    _model_info_lookup_cache.clear()
 
 
 def clear_model_info_cache() -> None:
@@ -374,3 +394,4 @@ def clear_model_info_cache() -> None:
     _model_info_cache = None
     _lookup_index = None
     _custom_models.clear()
+    _model_info_lookup_cache.clear()

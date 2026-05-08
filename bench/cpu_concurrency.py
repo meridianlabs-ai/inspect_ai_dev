@@ -118,17 +118,21 @@ def main() -> None:
     p.add_argument("--history", type=int, default=20)
     p.add_argument("--store-bytes", type=int, default=4096)
     p.add_argument("--max-connections", type=int, default=None)
+    p.add_argument(
+        "--register-model",
+        action="store_true",
+        help="Register mockllm/model in the info DB to bypass the get_model_info "
+        "fuzzy-match path (use to isolate other per-turn costs).",
+    )
     args = p.parse_args()
 
     max_conn = args.max_connections or args.samples
 
-    # Register the mock model in the info DB so get_model_info() does a fast
-    # dict hit instead of a fuzzy-match fallback (the latter is a separate,
-    # already-identified hotspot for unknown model names).
-    set_model_info(
-        "mockllm/model",
-        ModelInfo(context_length=128_000, output_tokens=4096, organization="mock"),
-    )
+    if args.register_model:
+        set_model_info(
+            "mockllm/model",
+            ModelInfo(context_length=128_000, output_tokens=4096, organization="mock"),
+        )
 
     model = get_model(
         "mockllm/model",
