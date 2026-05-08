@@ -1548,9 +1548,6 @@ def simple_input_messages(
     (according to a passed in folding function). Also collapses consecutive
     user messages (as many LLMs require an alternating structure)
     """
-    # start by making a deep copy so our mutations don't propagate (e.g. end up in log)
-    input = deepcopy(input)
-
     # aggregate system message from all system messages
     system_message = " ".join(
         [message.text for message in input if isinstance(message, ChatMessageSystem)]
@@ -1561,18 +1558,21 @@ def simple_input_messages(
         [message for message in input if not isinstance(message, ChatMessageSystem)]
     )
 
-    # fold the system message into the first user message
-    first_user_message = next(
-        message for message in messages if isinstance(message, ChatMessageUser)
+    # Replace the first user message with a copy whose text has the system
+    # message folded in. Only this one message is mutated — copying just that
+    # message is much cheaper than deep-copying the entire history.
+    user_index = next(
+        i for i, message in enumerate(messages) if isinstance(message, ChatMessageUser)
     )
+    first_user_message = messages[user_index].model_copy()
     if fold_system_message:
         first_user_message.text = fold_system_message(
             first_user_message.text, system_message
         )
     else:
         first_user_message.text = f"{system_message}\n\n{first_user_message.text}"
+    messages[user_index] = first_user_message
 
-    # all done!
     return messages
 
 
@@ -1653,31 +1653,34 @@ def resolve_tool_model_input(
     if len(tdefs) == 0:
         return messages
 
-    # don't mutate the original messages
-    messages = deepcopy(messages)
+    # Group tool messages by function name, recording each one's slot in the
+    # original list. We avoid copying the messages up-front; only messages
+    # whose content actually changes are replaced (with a model_copy).
+    total_tool_messages = 0
+    by_function: dict[str, list[tuple[int, ChatMessageTool]]] = {}
+    for i, message in enumerate(messages):
+        if isinstance(message, ChatMessageTool):
+            total_tool_messages += 1
+            if message.function is not None:
+                by_function.setdefault(message.function, []).append((i, message))
 
-    # extract tool messages
-    tool_messages = [
-        message for message in messages if isinstance(message, ChatMessageTool)
-    ]
-    # run model_input handlers over all tool_messages with the same function name
+    result: list[ChatMessage] | None = None
     for tdef in tdefs:
         assert tdef.model_input
-        # filter messages down to just this tool
-        tdef_tool_messages = [
-            message for message in tool_messages if message.function == tdef.name
-        ]
-        # call the function for each tool, passing the index, total, and content
-        for index, message in enumerate(tdef_tool_messages):
-            original_content = message.content
-            message.content = tdef.model_input(
-                index, len(tool_messages), message.content, hints
+        slots = by_function.get(tdef.name, [])
+        for index, (slot, message) in enumerate(slots):
+            new_content = tdef.model_input(
+                index, total_tool_messages, message.content, hints
             )
-            if message.content is not original_content:
-                message.id = uuid()
+            if new_content is message.content:
+                continue
+            if result is None:
+                result = list(messages)
+            result[slot] = message.model_copy(
+                update={"content": new_content, "id": uuid()}
+            )
 
-    # return modified messages
-    return messages
+    return result if result is not None else messages
 
 
 MEDIA_PLACEHOLDERS: dict[type, str] = {
